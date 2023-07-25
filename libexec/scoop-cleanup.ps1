@@ -27,10 +27,18 @@ if ($global -and !(is_admin)) {
     'ERROR: you need admin rights to cleanup global apps'; exit 1
 }
 
+Function rm_cleanup($path) {
+    $size = (Get-ChildItem -Recurse -File $path | Measure-Object -Property Length -Sum).sum
+    Remove-Item -Recurse -ErrorAction Stop -Force $path @args
+    return $size
+}
+
 function cleanup($app, $global, $verbose, $cache) {
+    $totalLength = 0
+
     $current_version = Select-CurrentVersion -AppName $app -Global:$global
     if ($cache) {
-        Remove-Item "$cachedir\$app#*" -Exclude "$app#$current_version#*"
+        $totalLength += rm_cleanup "$cachedir\$app#*" -Exclude "$app#$current_version#*"
     }
     $appDir = appdir $app $global
     $versions = Get-ChildItem $appDir -Name
@@ -47,18 +55,19 @@ function cleanup($app, $global, $verbose, $cache) {
         $dir = versiondir $app $version $global
         # unlink all potential old link before doing recursive Remove-Item
         unlink_persist_data (installed_manifest $app $version $global) $dir
-        Remove-Item $dir -ErrorAction Stop -Recurse -Force
+        $totalLength += rm_cleanup $dir
     }
     $leftVersions = Get-ChildItem $appDir
     if ($leftVersions.Length -eq 1 -and $leftVersions.Name -eq 'current' -and $leftVersions.LinkType) {
         attrib $leftVersions.FullName -R /L
-        Remove-Item $leftVersions.FullName -ErrorAction Stop -Force
+        $totalLength += rm_cleanup $leftVersions.FullName 
         $leftVersions = $null
     }
     if (!$leftVersions) {
-        Remove-Item $appDir -ErrorAction Stop -Force
+        $totalLength += rm_cleanup $appDir 
     }
     Write-Host ''
+    return $totalLength
 }
 
 if ($apps -or $all) {
@@ -74,13 +83,17 @@ if ($apps -or $all) {
     }
 
     # $apps is now a list of ($app, $global) tuples
-    $apps | ForEach-Object { cleanup @_ $verbose $cache }
+    $totalLength = 0
+    $apps | ForEach-Object {
+        $totalLength += cleanup @_ $verbose $cache
+    }
 
     if ($cache) {
-        Remove-Item "$cachedir\*.download" -ErrorAction Ignore
+        $totalLength += rm_cleanup "$cachedir\*.download" -ErrorAction Ignore
     }
 
     if (!$verbose) {
+        Write-Host "Deleted: $(filesize $totalLength)" -ForegroundColor Yellow
         success 'Everything is shiny now!'
     }
 }
