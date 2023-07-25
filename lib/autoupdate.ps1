@@ -357,10 +357,15 @@ function Update-ManifestProperty {
                     # Arch-spec
                     $Manifest.architecture | Get-Member -MemberType NoteProperty | ForEach-Object {
                         $arch = $_.Name
-                        $newURL = substitute (arch_specific 'url' $Manifest.autoupdate $arch) $Substitutions
-                        $newHash = HashHelper -AppName $AppName -Version $Version -HashExtraction (arch_specific 'hash' $Manifest.autoupdate $arch) -URL $newURL -Substitutions $Substitutions
-                        $Manifest.architecture.$arch.hash, $hasPropertyChanged = PropertyHelper -Property $Manifest.architecture.$arch.hash -Value $newHash
-                        $hasManifestChanged = $hasManifestChanged -or $hasPropertyChanged
+                        try {
+                            $newURL = substitute (arch_specific 'url' $Manifest.autoupdate $arch) $Substitutions
+                            $newHash = HashHelper -AppName $AppName -Version $Version -HashExtraction (arch_specific 'hash' $Manifest.autoupdate $arch) -URL $newURL -Substitutions $Substitutions
+                            $Manifest.architecture.$arch.hash, $hasPropertyChanged = PropertyHelper -Property $Manifest.architecture.$arch.hash -Value $newHash
+                            $hasManifestChanged = $hasManifestChanged -or $hasPropertyChanged
+                        } catch {
+                            Write-Warning "couldn't autoupdate architecture $arch, removing it from manifest"
+                            $Manifest.architecture.PSObject.Properties.Remove($arch)
+                        }
                     }
                 }
             } elseif ($Manifest.$currentProperty -and $Manifest.autoupdate.$currentProperty) {
