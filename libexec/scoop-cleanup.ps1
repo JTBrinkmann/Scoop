@@ -29,8 +29,12 @@ if ($global -and !(is_admin)) {
 
 Function rm_cleanup($path) {
     $size = (Get-ChildItem -Recurse -File $path | Measure-Object -Property Length -Sum).sum
-    Remove-Item -Recurse -ErrorAction Stop -Force $path @args
-    return $size
+    Remove-Item -Recurse -ErrorAction Continue -Force $path @args
+    if ($?) {
+        return $size
+    } else {
+      return 0
+    }
 }
 
 function cleanup($app, $global, $verbose, $cache) {
