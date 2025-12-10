@@ -85,140 +85,169 @@ function Start-Download ($url, $to, $cookies) {
     }
 }
 
-function Invoke-Download ($url, $to, $cookies, $progress) {
-    # download with filesize and progress indicator
-    $reqUrl = ($url -split '#')[0]
-    $wreq = [Net.WebRequest]::Create($reqUrl)
-    if ($wreq -is [Net.HttpWebRequest]) {
-        $wreq.UserAgent = Get-UserAgent
-        if (-not ($url -match 'sourceforge\.net' -or $url -match 'portableapps\.com')) {
-            $wreq.Referer = strip_filename $url
-        }
-        if ($url -match 'api\.github\.com/repos') {
-            $wreq.Accept = 'application/octet-stream'
-            $wreq.Headers['Authorization'] = "Bearer $(Get-GitHubToken)"
-            $wreq.Headers['X-GitHub-Api-Version'] = '2022-11-28'
-        }
-        if ($cookies) {
-            $wreq.Headers.Add('Cookie', (cookie_header $cookies))
-        }
+    function Invoke-Download ($url, $to, $cookies, $progress) {
+        # download with filesize and progress indicator
+        $reqUrl = ($url -split '#')[0]
+        $wreq = [Net.WebRequest]::Create($reqUrl)
+        if ($wreq -is [Net.HttpWebRequest]) {
+            $wreq.UserAgent = Get-UserAgent
+            if (-not ($url -match 'sourceforge\.net' -or $url -match 'portableapps\.com')) {
+                $wreq.Referer = strip_filename $url
+            }
+            if ($url -match 'api\.github\.com/repos') {
+                $wreq.Accept = 'application/octet-stream'
+                $wreq.Headers['Authorization'] = "Bearer $(Get-GitHubToken)"
+                $wreq.Headers['X-GitHub-Api-Version'] = '2022-11-28'
+            }
+            if ($cookies) {
+                $wreq.Headers.Add('Cookie', (cookie_header $cookies))
+            }
 
-        get_config PRIVATE_HOSTS | Where-Object { $_ -ne $null -and $url -match $_.match } | ForEach-Object {
-            (ConvertFrom-StringData -StringData $_.Headers).GetEnumerator() | ForEach-Object {
-                $wreq.Headers[$_.Key] = $_.Value
+            get_config PRIVATE_HOSTS | Where-Object { $_ -ne $null -and $url -match $_.match } | ForEach-Object {
+                (ConvertFrom-StringData -StringData $_.Headers).GetEnumerator() | ForEach-Object {
+                    $wreq.Headers[$_.Key] = $_.Value
+                }
+            }
+
+            # If a partial file exists, try to resume the download
+            $existingLength = (Get-Item -ea 0 $to).Length
+            if ($existingLength -gt 0) {
+                # Add Range header to request remaining bytes
+                $rangeHeader = "bytes=$existingLength-"
+                $wreq.Headers["Range"] = $rangeHeader
             }
         }
-    }
 
-    try {
-        $wres = $wreq.GetResponse()
-    } catch [System.Net.WebException] {
-        $exc = $_.Exception
-        $handledCodes = @(
-            [System.Net.HttpStatusCode]::MovedPermanently, # HTTP 301
-            [System.Net.HttpStatusCode]::Found, # HTTP 302
-            [System.Net.HttpStatusCode]::SeeOther, # HTTP 303
-            [System.Net.HttpStatusCode]::TemporaryRedirect  # HTTP 307
-        )
+        try {
+            $wres = $wreq.GetResponse()
+        } catch [System.Net.WebException] {
+            $exc = $_.Exception
+            $handledCodes = @(
+                [System.Net.HttpStatusCode]::MovedPermanently, # HTTP 301
+                [System.Net.HttpStatusCode]::Found, # HTTP 302
+                [System.Net.HttpStatusCode]::SeeOther, # HTTP 303
+                [System.Net.HttpStatusCode]::TemporaryRedirect  # HTTP 307
+            )
 
-        # Only handle redirection codes
-        $redirectRes = $exc.Response
-        if ($handledCodes -notcontains $redirectRes.StatusCode) {
-            throw $exc
+            # Only handle redirection codes
+            $redirectRes = $exc.Response
+            if ($handledCodes -notcontains $redirectRes.StatusCode) {
+                throw $exc
+            }
+
+            # Get the new location of the file
+            if ((-not $redirectRes.Headers) -or ($redirectRes.Headers -notcontains 'Location')) {
+                throw $exc
+            }
+
+            $newUrl = $redirectRes.Headers['Location']
+            info "Following redirect to $newUrl..."
+
+            # Handle manual file rename
+            if ($url -like '*#/*') {
+                $null, $postfix = $url -split '#/'
+                $newUrl = "$newUrl`#/$postfix"
+            }
+
+            Invoke-Download $newUrl $to $cookies $progress
+            return
+        }
+        
+        if (
+            $existingLength -gt 0 -and
+            $wres.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent -and
+            $wres.Headers["Content-Range"] -ne $null
+        ) {
+            # Open file stream in append mode
+            $total = [Math]::max($wres.ContentLength, ($wres.Headers["Content-Range"] -Split "/")[-1])
+            $fsMode = [System.IO.FileMode]::Append
+            Write-Host "continuing download ($(filesize $existingLength) already downloaded)..."
+        } else {
+            $existingLength = 0
+            $total = $wres.ContentLength
+            $fsMode = [System.IO.FileMode]::Create
         }
 
-        # Get the new location of the file
-        if ((-not $redirectRes.Headers) -or ($redirectRes.Headers -notcontains 'Location')) {
-            throw $exc
+        if ($total -eq -1 -and $wreq -is [net.ftpwebrequest]) {
+            $total = ftp_file_size($url)
         }
 
-        $newUrl = $redirectRes.Headers['Location']
-        info "Following redirect to $newUrl..."
-
-        # Handle manual file rename
-        if ($url -like '*#/*') {
-            $null, $postfix = $url -split '#/'
-            $newUrl = "$newUrl`#/$postfix"
-        }
-
-        Invoke-Download $newUrl $to $cookies $progress
-        return
-    }
-
-    $total = $wres.ContentLength
-    if ($total -eq -1 -and $wreq -is [net.ftpwebrequest]) {
-        $total = ftp_file_size($url)
-    }
-
-    if ($progress -and ($total -gt 0)) {
-        [console]::CursorVisible = $false
-        function Trace-DownloadProgress ($read) {
-            Write-DownloadProgress $read $total $url
-        }
-    } else {
-        Write-Host "Downloading $url ($(filesize $total))..."
-        function Trace-DownloadProgress {
-            #no op
-        }
-    }
-
-    try {
-        $s = $wres.getresponsestream()
-        $fs = [io.file]::openwrite($to)
-        $buffer = New-Object byte[] 2048
-        $totalRead = 0
-        $sw = [diagnostics.stopwatch]::StartNew()
-
-        Trace-DownloadProgress $totalRead
-        while (($read = $s.read($buffer, 0, $buffer.length)) -gt 0) {
-            $fs.write($buffer, 0, $read)
-            $totalRead += $read
-            if ($sw.elapsedmilliseconds -gt 100) {
-                $sw.restart()
-                Trace-DownloadProgress $totalRead
+        if ($progress -and ($total -gt 0)) {
+            [console]::CursorVisible = $false
+            function Trace-DownloadProgress ($read) {
+                Write-DownloadProgress $existingLength $read $total $url
+            }
+        } else {
+            Write-Host "Downloading $url ($(filesize $total))..."
+            function Trace-DownloadProgress {
+                #no op
             }
         }
-        $sw.stop()
-        Trace-DownloadProgress $totalRead
-    } finally {
-        if ($progress) {
-            [console]::CursorVisible = $true
-            Write-Host
-        }
-        if ($fs) {
-            $fs.close()
-        }
-        if ($s) {
-            $s.close()
-        }
-        $wres.close()
-    }
-}
 
-function Format-DownloadProgress ($url, $read, $total, $console) {
+        try {
+            $s = $wres.getresponsestream()
+            $fs = [io.file]::Open($to, $fsMode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $buffer = New-Object byte[] 2048
+            $totalRead = $existingLength
+            $sw = [diagnostics.stopwatch]::StartNew()
+
+            Trace-DownloadProgress $totalRead
+            while (($read = $s.read($buffer, 0, $buffer.length)) -gt 0) {
+                $fs.write($buffer, 0, $read)
+                $totalRead += $read
+                if ($sw.elapsedmilliseconds -gt 100) {
+                    $sw.restart()
+                    Trace-DownloadProgress $totalRead
+                }
+            }
+            $sw.stop()
+            Trace-DownloadProgress $totalRead
+        } finally {
+            if ($progress) {
+                [console]::CursorVisible = $true
+                Write-Host
+            }
+            if ($fs) {
+                $fs.close()
+            }
+            if ($s) {
+                $s.close()
+            }
+            $wres.close()
+        }
+    }
+
+function Format-DownloadProgress ($url, $existingLength, $read, $total, $console) {
     $filename = url_remote_filename $url
 
     # calculate current percentage done
-    $p = [math]::Round($read / $total * 100, 0)
+    $p1 = [math]::Round($existingLength / $total * 100, 0)
+    $p2 = [math]::Round($read / $total * 100, 0)
 
     # pre-generate LHS and RHS of progress string
     # so we know how much space we have
     $left = "$filename ($(filesize $total))"
-    $right = [string]::Format('{0,3}%', $p)
+    $right = [string]::Format('{0,3}%', $p2)
 
     # calculate remaining width for progress bar
     $midwidth = $console.BufferSize.Width - ($left.Length + $right.Length + 8)
 
     # calculate how many characters are completed
-    $completed = [math]::Abs([math]::Round(($p / 100) * $midwidth, 0) - 1)
+    $existing = [math]::Abs([math]::Round(($p1 / 100) * $midwidth, 0) - 1)
+    $completed = [math]::Abs([math]::Round(($p2 / 100) * $midwidth, 0) - 1)
 
+    # @{existingLength=$existingLength; read=$read; total=$total; p1=$p1; p2=$p2; midwidth=$midwidth; existing=$existing; completed=$completed} | json | Write-Host
     # generate dashes to symbolise completed
+    $dashes = ""
+    if ($existing -gt 1) {
+        $dashes += '-' * $existing
+    }
     if ($completed -gt 1) {
-        $dashes = [string]::Join('', ((1..$completed) | ForEach-Object { '=' }))
+        $dashes += '=' * ($completed - $existing)
     }
 
     # this is why we calculate $completed - 1 above
-    $dashes += switch ($p) {
+    $dashes += switch ($p2) {
         100 { '=' }
         default { '>' }
     }
@@ -234,14 +263,14 @@ function Format-DownloadProgress ($url, $read, $total, $console) {
     "$left [$dashes$spaces] $right"
 }
 
-function Write-DownloadProgress ($read, $total, $url) {
+function Write-DownloadProgress ($existingLength, $read, $total, $url) {
     $console = $Host.UI.RawUI
     $left = $console.CursorPosition.X
     $top = $console.CursorPosition.Y
     $width = $console.BufferSize.Width
 
-    if ($read -eq 0) {
-        $maxOutputLength = $(Format-DownloadProgress $url 100 $total $console).Length
+    if ($existingLength + $read -eq 0) {
+        $maxOutputLength = $(Format-DownloadProgress $url $existingLength 100 $total $console).Length
         if (($left + $maxOutputLength) -gt $width) {
             # not enough room to print progress on this line
             # print on new line
@@ -252,7 +281,7 @@ function Write-DownloadProgress ($read, $total, $url) {
         }
     }
 
-    Write-Host $(Format-DownloadProgress $url $read $total $console) -NoNewline
+    Write-Host $(Format-DownloadProgress $url $existingLength $read $total $console) -NoNewline
     [console]::SetCursorPosition($left, $top)
 }
 
